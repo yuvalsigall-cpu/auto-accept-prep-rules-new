@@ -57,20 +57,62 @@ def detect_columns(df):
             ts_col = v
     return units_col, prep_col, ts_col
 
-def to_seconds_factory(get_pandas_fn):
-    # returns a to_seconds function that uses pandas checks dynamically
+def to_seconds_factory(get_pandas_fn, get_numpy_fn=None):
     pd = get_pandas_fn()
+    np = None
+    if get_numpy_fn is not None:
+        try:
+            np = get_numpy_fn()
+        except Exception:
+            np = None
+
     def to_seconds(x):
-        if pd.isna(x):
-            return None
+        # Handle Series / ndarray / list by taking first non-null element if possible
+        try:
+            # pandas Series / numpy array / list-like handling
+            if hasattr(x, "dtype") or isinstance(x, (list, tuple)):
+                # convert to pandas Series for consistent handling
+                try:
+                    ser = pd.Series(x)
+                except Exception:
+                    ser = None
+                if ser is not None:
+                    # if all missing -> return None
+                    if ser.isna().all():
+                        return None
+                    # else take first non-null scalar
+                    try:
+                        first = ser[~ser.isna()].iloc[0]
+                        x = first
+                    except Exception:
+                        # fallback: try to coerce to scalar below
+                        pass
+        except Exception:
+            # defensive: continue to scalar handling
+            pass
+
+        # scalar handling
+        try:
+            if pd.isna(x):
+                return None
+        except Exception:
+            # pd.isna may return array-like in weird cases; treat as non-null and continue
+            pass
+
         if isinstance(x, (int, float)):
-            return int(x)
+            try:
+                return int(x)
+            except Exception:
+                return None
+
         s = str(x).strip()
+        if s == "":
+            return None
         if ":" in s:
             parts = [p for p in s.split(":") if p != ""]
             try:
                 parts = [int(p) for p in parts]
-            except:
+            except Exception:
                 return None
             if len(parts) == 3:
                 return parts[0] * 3600 + parts[1] * 60 + parts[2]
@@ -79,8 +121,9 @@ def to_seconds_factory(get_pandas_fn):
             return parts[0]
         try:
             return int(float(s))
-        except:
+        except Exception:
             return None
+
     return to_seconds
 
 def hour_bucket_from_hour(h):
@@ -104,7 +147,12 @@ def compute_p75_from_dataframe(df_input, lookback_months=6, venue=None, get_pand
       day_of_week, hour_bucket, units_bucket, p75_seconds, orders_count, base_p75_minutes
     """
     pd = get_pandas_fn()
-    np = get_numpy_fn()
+    np = None
+    try:
+        np = get_numpy_fn()
+    except Exception:
+        # numpy optional for percentile (pandas also supports quantile but we'll try to use numpy)
+        np = None
 
     units_col, prep_col, ts_col = detect_columns(df_input)
     if units_col is None or prep_col is None:
@@ -118,7 +166,7 @@ def compute_p75_from_dataframe(df_input, lookback_months=6, venue=None, get_pand
     df["units"] = pd.to_numeric(df[units_col], errors="coerce").fillna(0).astype(int)
 
     # prep_seconds
-    to_seconds = to_seconds_factory(get_pandas_fn)
+    to_seconds = to_seconds_factory(get_pandas_fn, get_numpy_fn)
     df["prep_seconds"] = df[prep_col].apply(to_seconds)
 
     # optional timestamp handling
@@ -130,8 +178,6 @@ def compute_p75_from_dataframe(df_input, lookback_months=6, venue=None, get_pand
 
     # optional venue filter (explicit check)
     if venue is not None and str(venue).strip() != "":
-        # check if there is a column that might be venue; if not, assume user filtered pre-upload
-        # (if you have a specific column name you can change this logic to use that column)
         possible_cols = [c for c in df.columns if "venue" in str(c).lower() or "merchant" in str(c).lower() or "store" in str(c).lower()]
         if possible_cols:
             col = possible_cols[0]
@@ -156,14 +202,16 @@ def compute_p75_from_dataframe(df_input, lookback_months=6, venue=None, get_pand
     # aggregate groups (explicit groupby columns)
     group_cols = ["day_of_week", "hour_bucket", "units_bucket"]
     rows = []
-    # use dropna=False to keep groups that may include NaN labels if any
     grouped = df.groupby(group_cols, dropna=False)
     for name, g in grouped:
-        # name is (day, hour_bucket, units_bucket)
         values = g["prep_seconds"].dropna().astype(float)
         if values.size == 0:
             continue
-        p75 = float(np.percentile(values, 75))
+        # compute p75 using numpy if available, else use pandas quantile
+        if np is not None:
+            p75 = float(np.percentile(values, 75))
+        else:
+            p75 = float(values.quantile(0.75))
         p75_rounded = round_half_up(p75 / 60.0) * 60
         rows.append({
             "day_of_week": name[0],
@@ -175,7 +223,8 @@ def compute_p75_from_dataframe(df_input, lookback_months=6, venue=None, get_pand
         })
 
     out = pd.DataFrame(rows) if len(rows) > 0 else pd.DataFrame(columns=["day_of_week","hour_bucket","units_bucket","p75_seconds","orders_count","base_p75_minutes"])
-    out = out.sort_values(["day_of_week","hour_bucket","units_bucket"])
+    if not out.empty:
+        out = out.sort_values(["day_of_week","hour_bucket","units_bucket"])
     return out
 
 # -------- Streamlit UI --------
@@ -191,15 +240,16 @@ venue_input = st.text_input("Venue (אופציונלי)")
 if uploaded is not None:
     st.info("קובץ נקלט. הקש Generate כדי להתחיל.")
     if st.button("Generate CSV"):
-        # show loading spinner and robust exception output
         try:
             with st.spinner("טוען ספריות ובודק נתונים..."):
-                # Try to obtain pandas/numpy (will wait if the environment still installs)
                 pd = get_pandas()
-                np = get_numpy()
-            # read excel into dataframe
+                # numpy optional
+                try:
+                    np = get_numpy()
+                except Exception:
+                    np = None
+            # read excel into dataframe (read bytes to avoid file handle issues)
             try:
-                # read bytes with pandas
                 df_input = pd.read_excel(BytesIO(uploaded.read()), engine="openpyxl")
             except Exception as e_read:
                 st.error("שגיאה בקריאת הקובץ כ־Excel — נסה לשמור כ־XLSX תקין.")
@@ -220,7 +270,6 @@ if uploaded is not None:
             tb = traceback.format_exc()
             st.error("שגיאה בחישוב — פירוט מלא למטה (העתק ושלח לי את הטקסט הזה אם צריך עזרה).")
             st.code(tb)
-            # also log to server console
             print(tb)
 else:
     st.info("העלאת קובץ מוצגת כאן — גרור ושחרר XLSX או לחץ Browse files.")
