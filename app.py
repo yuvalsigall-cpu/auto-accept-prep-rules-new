@@ -1,13 +1,12 @@
-# app.py
+# app.py (תעתיק/הדבק את כל הקובץ הזה)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import math
 from datetime import datetime
-from io import StringIO, BytesIO
+from io import BytesIO
 
 st.set_page_config(page_title="Auto-Accept Prep Rules", layout="centered")
-
 
 UNIT_BINS = [0, 5, 10, 15, 20, 25, 55, 99999]
 HOUR_BUCKETS = [
@@ -15,7 +14,6 @@ HOUR_BUCKETS = [
     ("12-17", 12, 16),
     ("17-23", 17, 22),
 ]
-
 
 def detect_columns(df: pd.DataFrame):
     cols = {c.lower(): c for c in df.columns}
@@ -31,12 +29,9 @@ def detect_columns(df: pd.DataFrame):
             ts_col = v
     return units_col, prep_col, ts_col
 
-
 def to_seconds(x):
-    # handle NaN
     if pd.isna(x):
         return None
-    # numbers -> seconds assumed
     if isinstance(x, (int, float)):
         return int(x)
     s = str(x).strip()
@@ -55,52 +50,52 @@ def to_seconds(x):
     except:
         return None
 
-
 def hour_bucket_from_hour(h):
     for name, start, end in HOUR_BUCKETS:
         if start <= h <= end:
             return name
     return "other"
 
-
 def round_half_up(x):
     return int(math.floor(x + 0.5))
 
-
-def compute_p75_dataframe(df: pd.DataFrame, lookback_months=6, venue=None):
-    # detect
+def compute_p75_dataframe(df: pd.DataFrame, lookback_months=6, venue: str | None = None):
+    # detect columns
     units_col, prep_col, ts_col = detect_columns(df)
     if units_col is None or prep_col is None:
         raise ValueError(
-            "לא ניתן למצוא עמודת 'units' או עמודת 'prep time' בקובץ. עמודות שנמצאו: "
-            + ", ".join(df.columns.astype(str))
+            "לא נמצא units או prep column. כותרות בקובץ: " + ", ".join(df.columns.astype(str))
         )
 
-    # keep relevant
-    cols = [units_col, prep_col]
-    if ts_col:
-        cols.append(ts_col)
-    df = df[cols].copy()
+    # keep only relevant columns safely
+    keep_cols = [units_col, prep_col]
+    if ts_col is not None and ts_col in df.columns:
+        keep_cols.append(ts_col)
+    df = df[keep_cols].copy()
 
     # units -> int
     df["units"] = pd.to_numeric(df[units_col], errors="coerce").fillna(0).astype(int)
     df["prep_seconds"] = df[prep_col].apply(to_seconds)
 
-    # optional venue filter if the dataset has a column named 'venue' or similar
-    if venue:
-        # try to find a column that looks like venue
+    # optional venue filtering: only if user provided non-empty string
+    if venue is not None and str(venue).strip() != "":
+        # find candidate column name for venue
         possible = [c for c in df.columns if "venue" in c.lower() or "merchant" in c.lower() or "store" in c.lower()]
-        if possible:
+        if len(possible) > 0:
             col = possible[0]
+            # use str.contains safely (na=False)
             df = df[df[col].astype(str).str.contains(str(venue), case=False, na=False)]
+        else:
+            # if user asked to filter but there is no venue-like column, return empty result
+            return pd.DataFrame([])
 
-    # timestamps and lookback
-    if ts_col and ts_col in df.columns:
+    # timestamps & lookback
+    if ts_col is not None and ts_col in df.columns:
         df["ts"] = pd.to_datetime(df[ts_col], errors="coerce")
         cutoff = pd.Timestamp.now() - pd.DateOffset(months=lookback_months)
         df = df[df["ts"].isna() | (df["ts"] >= cutoff)]
 
-    # day/hour
+    # derive day / hour
     if "ts" in df.columns and df["ts"].notna().any():
         df["day_of_week"] = df["ts"].dt.day_name()
         df["hour"] = df["ts"].dt.hour
@@ -110,91 +105,71 @@ def compute_p75_dataframe(df: pd.DataFrame, lookback_months=6, venue=None):
 
     df["hour_bucket"] = df["hour"].apply(hour_bucket_from_hour)
 
-    # units bucket labels
+    # units buckets
     labels = []
     for i in range(len(UNIT_BINS) - 1):
         labels.append(f"{UNIT_BINS[i] + 1}-{UNIT_BINS[i + 1] if UNIT_BINS[i + 1] < 99999 else '999'}")
-
     df["units_bucket"] = pd.cut(df["units"], bins=UNIT_BINS, labels=labels, right=True)
 
-    # group and compute
+    # group and compute p75
     rows = []
     group_cols = ["day_of_week", "hour_bucket", "units_bucket"]
     grouped = df.groupby(group_cols, dropna=False)
 
     for name, g in grouped:
-        day, hour_b, units_b = name
+        # name is a tuple (day, hour_bucket, units_bucket)
         values = g["prep_seconds"].dropna().astype(float)
-        if len(values) == 0:
+        if values.size == 0:
             continue
-
         p75 = float(np.percentile(values, 75))
         p75_rounded = round_half_up(p75 / 60.0) * 60
-
         rows.append({
-            "day_of_week": day,
-            "hour_bucket": hour_b,
-            "units_bucket": str(units_b),
+            "day_of_week": name[0],
+            "hour_bucket": name[1],
+            "units_bucket": str(name[2]),
             "p75_seconds": int(p75_rounded),
-            "orders_count": int(len(values)),
+            "orders_count": int(values.size),
             "base_p75_minutes": int(p75_rounded // 60)
         })
 
     out = pd.DataFrame(rows)
-    out = out.sort_values(["day_of_week", "hour_bucket", "units_bucket"])
+    if not out.empty:
+        out = out.sort_values(["day_of_week", "hour_bucket", "units_bucket"])
     return out
 
-
-# ---- Streamlit UI ----
+# Streamlit UI
 st.title("Auto-Accept Prep Rules")
-st.markdown("מחשב CSV להעלאה לקבוצת אקפט — העלה קובץ Excel (order level) והורד CSV עם p75 לפי קבוצות.")
+st.markdown("מחשב CSV עם p75 preparation time. העלה Excel ואז לחץ Generate.")
 
-uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx", "xls"], accept_multiple_files=False)
-col1, col2 = st.columns([1, 1])
-with col1:
-    venue = st.text_input("Venue (אופציונלי)")
-with col2:
-    lookback_months = st.number_input("Lookback months", min_value=0, max_value=24, value=6, step=1)
-
+uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx", "xls"])
+venue = st.text_input("Venue (אופציונלי)")
+lookback_months = st.number_input("Lookback months", min_value=0, max_value=24, value=6, step=1)
 generate = st.button("Generate CSV")
 
 if uploaded is not None:
-    st.info(f"Uploaded: {uploaded.name} — size {uploaded.size} bytes")
-else:
-    st.info("אין קובץ מעומסת")
+    st.info(f"Uploaded {uploaded.name} ({uploaded.size} bytes)")
 
 if generate:
     if uploaded is None:
-        st.error("יש לבחור קובץ Excel לפני לחיצה על Generate CSV")
+        st.error("בחר קובץ לפני הפעלת הייצור")
     else:
         try:
-            # read file into pandas (openpyxl used automatically for .xlsx)
-            df_input = pd.read_excel(uploaded, engine="openpyxl")
+            df_in = pd.read_excel(uploaded, engine="openpyxl")
         except Exception as e:
             st.exception(f"שגיאה בקריאת הקובץ: {e}")
         else:
             try:
-                with st.spinner("מחשב..."):
-                    out_df = compute_p75_dataframe(df_input, lookback_months=lookback_months, venue=venue if venue else None)
+                with st.spinner("מחשב p75..."):
+                    out_df = compute_p75_dataframe(df_in, lookback_months=lookback_months, venue=venue)
                 if out_df.empty:
-                    st.warning("לא נמצאו ריצות/ערכים מתאימים בתוצאות — בדוק את נתוני הקובץ והעמודות.")
+                    st.warning("לא נוצרו שורות — בדוק פילטר Venue/כותרות/טווח זמן.")
                 else:
                     st.success("חישוב הושלם.")
                     st.dataframe(out_df.head(200))
-
-                    # prepare CSV for download
                     csv_bytes = out_df.to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        label="הורד CSV",
-                        data=csv_bytes,
-                        file_name="prep_p75.csv",
-                        mime="text/csv"
-                    )
+                    st.download_button("הורד CSV", data=csv_bytes, file_name="prep_p75.csv", mime="text/csv")
             except Exception as e:
                 st.exception(f"שגיאה בחישוב: {e}")
 
 st.markdown("---")
-st.markdown("הסברים וטיפים:")
-st.markdown("- ודא שהקובץ כולל עמודה למספר פריטים ('units', 'items', 'qty') ועמודת זמן/זמן הכנה ('prep','prepare','time').")
-st.markdown("- אם יש לך עמודת venue/merchant בשם שונה, כתוב את הטקסט בשדה 'Venue' כדי לסנן.")
-st.markdown("- אם יש בעיה נוספת, שלח לי את ה־Traceback (לשונית Manage app → Logs).")
+st.markdown("טיפים: ודא שיש עמודת units (או items/qty) ועמודת prep/time. אם השמות שונים שלח לי את כותרות העמודות.")
