@@ -8,30 +8,44 @@ Read an order-level Excel and compute p75 preparation time per:
 Outputs CSV with columns:
 day_of_week, hour_bucket, units_bucket, p75_seconds, orders_count, base_p75_minutes
 """
-
 import argparse
 import math
 import time
 import importlib
 
+# -------- lazy loaders (more robust: retries + backoff) --------
+def _try_import(name):
+    try:
+        return importlib.import_module(name)
+    except ModuleNotFoundError:
+        return None
 
-# -------- lazy loaders --------
-def get_numpy(retries=5, delay=1.0):
-    for _ in range(retries):
-        try:
-            return importlib.import_module("numpy")
-        except ModuleNotFoundError:
-            time.sleep(delay)
-    raise ModuleNotFoundError("numpy not available")
+def get_numpy(retries=40, delay=1.5):
+    """
+    Try to import numpy multiple times with exponential-ish backoff.
+    This helps when the environment is still installing dependencies.
+    """
+    backoff = delay
+    for i in range(retries):
+        mod = _try_import("numpy")
+        if mod is not None:
+            return mod
+        time.sleep(backoff)
+        backoff = min(backoff * 1.15, 5.0)
+    raise ModuleNotFoundError("numpy not available after retries")
 
-
-def get_pandas(retries=5, delay=1.0):
-    for _ in range(retries):
-        try:
-            return importlib.import_module("pandas")
-        except ModuleNotFoundError:
-            time.sleep(delay)
-    raise ModuleNotFoundError("pandas not available")
+def get_pandas(retries=40, delay=1.5):
+    """
+    Try to import pandas multiple times with backoff.
+    """
+    backoff = delay
+    for i in range(retries):
+        mod = _try_import("pandas")
+        if mod is not None:
+            return mod
+        time.sleep(backoff)
+        backoff = min(backoff * 1.15, 5.0)
+    raise ModuleNotFoundError("pandas not available after retries")
 
 
 # -------- constants --------
@@ -63,34 +77,38 @@ def detect_columns(df):
     for k, v in cols.items():
         if any(x in k for x in ("units", "items", "qty")) and units_col is None:
             units_col = v
-        if any(x in k for x in ("prep", "prepare", "preparation", "time")) and prep_col is None:
+        if any(x in k for x in ("prep", "prepare", "preparation", "time to prepare", "time")) and prep_col is None:
             prep_col = v
-        if any(x in k for x in ("timestamp", "date", "created")) and ts_col is None:
+        if any(x in k for x in ("timestamp", "time", "date", "created")) and ts_col is None:
             ts_col = v
 
     return units_col, prep_col, ts_col
 
 
 def to_seconds(x):
+    """
+    Convert various representations to integer seconds.
+    Uses pandas' isna check via dynamic import to avoid top-level import timing issues.
+    """
     pd = get_pandas()
 
     if pd.isna(x):
         return None
     if isinstance(x, (int, float)):
+        # assume seconds already
         return int(x)
 
-    s = str(x)
+    s = str(x).strip()
     if ":" in s:
-        parts = [int(p) for p in s.split(":")]
+        parts = [int(p) for p in s.split(":") if p != ""]
         if len(parts) == 3:
             return parts[0] * 3600 + parts[1] * 60 + parts[2]
         if len(parts) == 2:
             return parts[0] * 60 + parts[1]
         return parts[0]
-
     try:
         return int(float(s))
-    except:
+    except Exception:
         return None
 
 
@@ -107,13 +125,16 @@ def round_half_up(x):
 
 # -------- main logic --------
 def main():
+    # get pandas & numpy (will retry if needed)
     pd = get_pandas()
     np = get_numpy()
 
     args = parse_args()
 
+    # read excel
     df = pd.read_excel(args.input, engine="openpyxl")
 
+    # detect columns heuristically
     units_col, prep_col, ts_col = detect_columns(df)
     if units_col is None or prep_col is None:
         raise SystemExit(
@@ -121,16 +142,21 @@ def main():
             + ", ".join(df.columns.astype(str))
         )
 
+    # keep only relevant columns
     df = df[[units_col, prep_col] + ([ts_col] if ts_col else [])].copy()
 
+    # numeric units
     df["units"] = pd.to_numeric(df[units_col], errors="coerce").fillna(0).astype(int)
+    # prep seconds
     df["prep_seconds"] = df[prep_col].apply(to_seconds)
 
+    # optional timestamp filtering (lookback)
     if ts_col and ts_col in df.columns:
         df["ts"] = pd.to_datetime(df[ts_col], errors="coerce")
         cutoff = pd.Timestamp.now() - pd.DateOffset(months=args.lookback_months)
         df = df[df["ts"].isna() | (df["ts"] >= cutoff)]
 
+    # day / hour
     if "ts" in df.columns and df["ts"].notna().any():
         df["day_of_week"] = df["ts"].dt.day_name()
         df["hour"] = df["ts"].dt.hour
@@ -140,6 +166,7 @@ def main():
 
     df["hour_bucket"] = df["hour"].apply(hour_bucket_from_hour)
 
+    # units buckets labels
     labels = []
     for i in range(len(UNIT_BINS) - 1):
         labels.append(
@@ -150,6 +177,7 @@ def main():
         df["units"], bins=UNIT_BINS, labels=labels, right=True
     )
 
+    # aggregate
     rows = []
     group_cols = ["day_of_week", "hour_bucket", "units_bucket"]
 
@@ -158,6 +186,7 @@ def main():
         if len(values) == 0:
             continue
 
+        # percentile and rounding
         p75 = float(np.percentile(values, 75))
         p75_rounded = round_half_up(p75 / 60.0) * 60
 
