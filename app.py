@@ -1,39 +1,40 @@
-import os
+import streamlit as st
+import pandas as pd
 import tempfile
 import subprocess
-from flask import Flask, request, send_file, render_template_string
+import os
 
-app = Flask(__name__)
-INDEX_HTML = """
-<!doctype html>
-<title>Auto-accept prep rules - upload</title>
-<h2>Upload Excel (order-level)</h2>
-<form method=post enctype=multipart/form-data>
-  <input type=file name=file accept=".xlsx,.xls" required>
-  <br><br>
-  <label>Venue (optional): <input type=text name=venue></label>
-  <br><br>
-  <button type=submit>Upload & Generate CSV</button>
-</form>
-"""
+st.title("Auto-Accept Prep Rules")
 
-@app.route("/", methods=["GET","POST"])
-def index():
-    if request.method == "GET":
-        return render_template_string(INDEX_HTML)
-    f = request.files.get("file")
-    if not f:
-        return "No file", 400
-    venue = request.form.get("venue") or ""
-    tmpdir = tempfile.mkdtemp()
-    inpath = os.path.join(tmpdir, "input.xlsx")
-    outpath = os.path.join(tmpdir, "out.csv")
-    f.save(inpath)
-    cmd = ["python3", "process_prep.py", "--input", inpath, "--out", outpath]
-    if venue:
-        cmd += ["--venue", venue]
-    subprocess.check_call(cmd)
-    return send_file(outpath, as_attachment=True, download_name="prep_rules.csv")
+st.write("העלה קובץ אקסל ותקבל CSV מוכן")
 
-if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+uploaded_file = st.file_uploader("Upload Excel", type=["xlsx"])
+venue = st.text_input("Venue (אופציונלי)")
+
+if uploaded_file is not None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, "input.xlsx")
+        output_path = os.path.join(tmpdir, "output.csv")
+
+        with open(input_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+
+        if st.button("Generate CSV"):
+            cmd = ["python", "process_prep.py", "--input", input_path, "--out", output_path]
+            if venue:
+                cmd += ["--venue", venue]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+            if result.returncode != 0:
+                st.error("שגיאה בהרצה")
+                st.code(result.stderr)
+            else:
+                st.success("הקובץ מוכן!")
+                with open(output_path, "rb") as f:
+                    st.download_button(
+                        "Download CSV",
+                        f,
+                        file_name="prep_rules.csv",
+                        mime="text/csv"
+                    )
