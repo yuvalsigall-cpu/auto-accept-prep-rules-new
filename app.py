@@ -67,28 +67,22 @@ def to_seconds_factory(get_pandas_fn, get_numpy_fn=None):
             np = None
 
     def to_seconds(x):
-        # Handle Series / ndarray / list by taking first non-null element if possible
+        # Handle Series / ndarray / list-like by taking first non-null element if possible
         try:
-            # pandas Series / numpy array / list-like handling
             if hasattr(x, "dtype") or isinstance(x, (list, tuple)):
-                # convert to pandas Series for consistent handling
                 try:
                     ser = pd.Series(x)
                 except Exception:
                     ser = None
                 if ser is not None:
-                    # if all missing -> return None
                     if ser.isna().all():
                         return None
-                    # else take first non-null scalar
                     try:
                         first = ser[~ser.isna()].iloc[0]
                         x = first
                     except Exception:
-                        # fallback: try to coerce to scalar below
                         pass
         except Exception:
-            # defensive: continue to scalar handling
             pass
 
         # scalar handling
@@ -96,7 +90,6 @@ def to_seconds_factory(get_pandas_fn, get_numpy_fn=None):
             if pd.isna(x):
                 return None
         except Exception:
-            # pd.isna may return array-like in weird cases; treat as non-null and continue
             pass
 
         if isinstance(x, (int, float)):
@@ -151,7 +144,6 @@ def compute_p75_from_dataframe(df_input, lookback_months=6, venue=None, get_pand
     try:
         np = get_numpy_fn()
     except Exception:
-        # numpy optional for percentile (pandas also supports quantile but we'll try to use numpy)
         np = None
 
     units_col, prep_col, ts_col = detect_columns(df_input)
@@ -165,9 +157,24 @@ def compute_p75_from_dataframe(df_input, lookback_months=6, venue=None, get_pand
     # numeric units
     df["units"] = pd.to_numeric(df[units_col], errors="coerce").fillna(0).astype(int)
 
-    # prep_seconds
+    # --- SAFETY CHECKS BEFORE PREP CONVERSION ---
+    # Warn about duplicate column names or duplicate index
+    dup_cols = df.columns[df.columns.duplicated()].tolist()
+    if dup_cols:
+        # print to server log and keep a warning row in dataframe context
+        print("WARNING: duplicate column names found:", dup_cols)
+    if df.index.duplicated().any():
+        print("WARNING: duplicate index values found in df.index")
+
+    # prep_seconds: use list comprehension to avoid pandas reindex issues
     to_seconds = to_seconds_factory(get_pandas_fn, get_numpy_fn)
-    df["prep_seconds"] = df[prep_col].apply(to_seconds)
+    prep_list = [ to_seconds(x) for x in df[prep_col].tolist() ]
+
+    # ensure length matches
+    if len(prep_list) != len(df):
+        raise RuntimeError("prep_list length mismatch: {} vs {}".format(len(prep_list), len(df)))
+
+    df["prep_seconds"] = prep_list
 
     # optional timestamp handling
     if ts_col is not None and ts_col in df.columns:
