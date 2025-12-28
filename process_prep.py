@@ -13,10 +13,9 @@ import argparse
 import math
 import time
 import importlib
-import pandas as pd
 
 
-# -------- numpy lazy loader (חשוב!) --------
+# -------- lazy loaders --------
 def get_numpy(retries=5, delay=1.0):
     for _ in range(retries):
         try:
@@ -24,6 +23,15 @@ def get_numpy(retries=5, delay=1.0):
         except ModuleNotFoundError:
             time.sleep(delay)
     raise ModuleNotFoundError("numpy not available")
+
+
+def get_pandas(retries=5, delay=1.0):
+    for _ in range(retries):
+        try:
+            return importlib.import_module("pandas")
+        except ModuleNotFoundError:
+            time.sleep(delay)
+    raise ModuleNotFoundError("pandas not available")
 
 
 # -------- constants --------
@@ -64,6 +72,8 @@ def detect_columns(df):
 
 
 def to_seconds(x):
+    pd = get_pandas()
+
     if pd.isna(x):
         return None
     if isinstance(x, (int, float)):
@@ -97,6 +107,9 @@ def round_half_up(x):
 
 # -------- main logic --------
 def main():
+    pd = get_pandas()
+    np = get_numpy()
+
     args = parse_args()
 
     df = pd.read_excel(args.input, engine="openpyxl")
@@ -140,10 +153,7 @@ def main():
     rows = []
     group_cols = ["day_of_week", "hour_bucket", "units_bucket"]
 
-    for name, g in df.groupby(group_cols):
-        np = get_numpy()  # ← זה התיקון הקריטי
-        day, hour_b, units_b = name
-
+    for (day, hour_b, units_b), g in df.groupby(group_cols):
         values = g["prep_seconds"].dropna().astype(float)
         if len(values) == 0:
             continue
