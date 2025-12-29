@@ -1,109 +1,104 @@
-# app.py
-import streamlit as st
-import pandas as pd
-import numpy as np
+#!/usr/bin/env python3
+"""
+process_prep.py
+Read an order-level Excel and compute p75 preparation time per:
+ - day_of_week (Monday..Sunday)  <- supports existing day column names (Heb/Eng/numbers)
+ - hour_bucket (06-12,12-17,17-23) <- supports existing hour column
+ - units_bucket (1-5, 6-10, 11-15, ...)
+Outputs CSV with columns:
+day_of_week, hour_bucket, units_bucket, p75_seconds, orders_count, base_p75_minutes
+"""
+import argparse
 import math
-from io import BytesIO
+import time
+import importlib
+import os
 
-st.set_page_config(page_title="Prep Time P75", layout="wide")
-st.title("Prep Time P75 Generator")
-
-# ---------------- CONFIG ----------------
-UNIT_BINS = [0, 5, 10, 15, 20, 25, 55, 10**9]
-HOUR_BUCKETS = [
-    ("06-12", 6, 11),
-    ("12-17", 12, 16),
-    ("17-23", 17, 22),
-]
-
-# ---------------- HELPERS ----------------
-def make_columns_unique(cols):
-    """
-    Ensure column names are unique.
-    If a name repeats, append _1, _2, ...
-    cols: iterable of column names
-    returns: list of unique column names in same order
-    """
-    out = []
-    counts = {}
-    for c in cols:
-        base = str(c)
-        if base not in counts:
-            counts[base] = 0
-            out.append(base)
-        else:
-            counts[base] += 1
-            new = f"{base}_{counts[base]}"
-            # ensure new isn't already used (rare)
-            i = 1
-            while new in counts:
-                i += 1
-                new = f"{base}_{counts[base]}_{i}"
-            counts[new] = 0
-            out.append(new)
-    return out
-
-
-def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Make column names unique and strip whitespace.
-    """
-    df = df.copy()
-    cols = [str(c).strip() for c in df.columns]
-    unique = make_columns_unique(cols)
-    df.columns = unique
-    return df
-
-
-def detect_columns(df: pd.DataFrame):
-    """
-    Heuristic: find units and prep columns.
-    Returns (units_col, prep_col, ts_col_or_None)
-    """
-    units_col = None
-    prep_col = None
-    ts_col = None
-    for c in df.columns:
-        cl = c.lower()
-        if units_col is None and any(x in cl for x in ["units", "items", "qty", "quantity"]):
-            units_col = c
-        if prep_col is None and any(x in cl for x in ["prep", "prepare", "preparation", "time to prepare", "time"]):
-            # avoid matching 'order time' as prep accidentally: prefer exact tokens
-            prep_col = c
-        if ts_col is None and any(x in cl for x in ["timestamp", "time", "date", "created", "order_time", "order date"]):
-            ts_col = c
-    return units_col, prep_col, ts_col
-
-
-def to_seconds_safe(x):
-    """
-    Convert value to seconds safely. Returns np.nan on failure.
-    Handles numbers, strings 'hh:mm:ss' or 'mm:ss', pandas Timedelta.
-    """
-    if x is None:
-        return np.nan
-    # pandas NA checks
-    if pd.isna(x):
-        return np.nan
-
-    # pandas Timedelta or similar
+# -------- lazy loaders (retries/backoff) --------
+def _try_import(name):
     try:
-        if hasattr(x, "total_seconds"):
-            return float(x.total_seconds())
-    except Exception:
-        pass
+        return importlib.import_module(name)
+    except ModuleNotFoundError:
+        return None
 
-    # numeric
-    if isinstance(x, (int, float, np.integer, np.floating)):
-        return float(x)
+def get_numpy(retries=10, delay=0.5):
+    backoff = delay
+    for _ in range(retries):
+        m = _try_import("numpy")
+        if m is not None:
+            return m
+        time.sleep(backoff)
+        backoff = min(backoff * 1.2, 3.0)
+    raise ModuleNotFoundError("numpy not available")
 
-    s = str(x).strip()
+def get_pandas(retries=10, delay=0.5):
+    backoff = delay
+    for _ in range(retries):
+        m = _try_import("pandas")
+        if m is not None:
+            return m
+        time.sleep(backoff)
+        backoff = min(backoff * 1.2, 3.0)
+    raise ModuleNotFoundError("pandas not available")
+
+
+# -------- constants --------
+UNIT_BINS = [0, 5, 10, 15, 20, 25, 55, 99999]
+HOUR_BUCKETS = [("06-12", 6, 11), ("12-17", 12, 16), ("17-23", 17, 22)]
+MERGE_THRESHOLD_SEC = 4 * 60  # איחוד מדרגות אם p75 קרובים פחות מ-4 דק
+
+# השמות שאתה ציינת:
+DAY_COL_CANDIDATE = "Time Delivered Day of Week"
+HOUR_COL_CANDIDATE = "Time Received Hour of the Day"
+
+# -------- helpers --------
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--input", "-i", required=True, help="input Excel (.xlsx)")
+    p.add_argument("--out", "-o", required=True, help="output CSV")
+    p.add_argument("--lookback_months", type=int, default=6, help="how many months back to keep (requires timestamp column)")
+    return p.parse_args()
+
+def normalize_day_col(pd, val):
+    if pd.isna(val):
+        return None
+    s = str(val).strip()
     if s == "":
-        return np.nan
+        return None
+    lower = s.lower()
+    mapping = {
+        # numbers
+        "0":"Sunday","1":"Monday","2":"Tuesday","3":"Wednesday","4":"Thursday","5":"Friday","6":"Saturday",
+        # english short
+        "sun":"Sunday","mon":"Monday","tue":"Tuesday","wed":"Wednesday","thu":"Thursday","fri":"Friday","sat":"Saturday",
+        # english full
+        "sunday":"Sunday","monday":"Monday","tuesday":"Tuesday","wednesday":"Wednesday","thursday":"Thursday","friday":"Friday","saturday":"Saturday",
+        # hebrew common forms
+        "ראשון":"Sunday","שני":"Monday","שלישי":"Tuesday","רביעי":"Wednesday","חמישי":"Thursday","שישי":"Friday","שבת":"Saturday",
+        "יום ראשון":"Sunday","יום שני":"Monday","יום שלישי":"Tuesday","יום רביעי":"Wednesday","יום חמישי":"Thursday","יום שישי":"Friday","יום שבת":"Saturday",
+        "שני":"Monday", "ששי":"Friday"
+    }
+    return mapping.get(lower, s)  # אם לא מזוהה נחזיר את המלל המקורי (יכול להיות כבר באנגלית תקינה)
 
-    # hh:mm:ss or mm:ss
+def to_seconds_safe(pd, x):
+    # המרת פורמטים שונים לשניות (int/float/'mm:ss'/'hh:mm:ss'/Timedelta)
+    import numpy as _np
+    if isinstance(x, (pd.Series, pd.DataFrame)):
+        try:
+            x = x.iloc[0]
+        except Exception:
+            return _np.nan
+    if pd.isna(x):
+        return _np.nan
+    # pandas Timedelta
+    import datetime
+    if isinstance(x, datetime.timedelta):
+        return x.total_seconds()
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip()
     if ":" in s:
-        parts = s.split(":")
+        parts = [p for p in s.split(":") if p != ""]
         try:
             parts = [int(p) for p in parts]
             if len(parts) == 3:
@@ -111,124 +106,146 @@ def to_seconds_safe(x):
             if len(parts) == 2:
                 return parts[0]*60 + parts[1]
             return float(parts[0])
-        except Exception:
-            return np.nan
-
-    # plain number string
+        except:
+            try:
+                return float(s)
+            except:
+                return _np.nan
     try:
         return float(s)
-    except Exception:
-        return np.nan
+    except:
+        return _np.nan
 
-
-def hour_bucket(h):
+def hour_bucket_from_hour(h):
     try:
-        h = int(float(h))
-    except Exception:
+        h = int(h)
+    except:
         return "other"
     for name, start, end in HOUR_BUCKETS:
         if start <= h <= end:
             return name
     return "other"
 
+def round_half_up_seconds(seconds):
+    minutes = seconds / 60.0
+    rounded_min = int(math.floor(minutes + 0.5))
+    return rounded_min * 60
 
-def round_half_up_minutes(seconds):
-    # seconds -> rounded minutes (half up)
-    if pd.isna(seconds):
-        return 0
-    return int(math.floor(seconds / 60.0 + 0.5))
+# -------- main logic --------
+def main():
+    pd = get_pandas()
+    np = get_numpy()
+    args = parse_args()
 
+    # read input
+    df = pd.read_excel(args.input, engine="openpyxl")
 
-# ---------------- UI ----------------
-uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
-generate = st.button("Generate CSV")
+    # handle duplicate column names by renaming duplicates (so assignment won't error)
+    if df.columns.duplicated().any():
+        cols = list(df.columns)
+        counts = {}
+        newcols = []
+        for c in cols:
+            counts.setdefault(c, 0)
+            if counts[c] == 0:
+                newcols.append(c)
+            else:
+                newcols.append(f"{c}__dup{counts[c]}")
+            counts[c] += 1
+        df.columns = newcols
 
-if generate:
-    if uploaded is None:
-        st.error("Please upload an Excel file")
-        st.stop()
-
-    try:
-        df_raw = pd.read_excel(BytesIO(uploaded.read()), engine="openpyxl")
-    except Exception as e:
-        st.exception(e)
-        st.stop()
-
-    # Fix duplicate headers and whitespace
-    df = clean_columns(df_raw)
-
-    # Detect columns
-    units_col, prep_col, ts_col = detect_columns(df)
+    # detect units & prep columns heuristically (if names differ)
+    cols_lower = {str(c).lower(): c for c in df.columns}
+    units_col = None
+    prep_col = None
+    ts_col = None
+    for k, v in cols_lower.items():
+        if units_col is None and any(x in k for x in ("units", "items", "qty", "quantity")):
+            units_col = v
+        if prep_col is None and any(x in k for x in ("prep", "prepare", "preparation", "time to prepare", "prep_seconds", "prep_time", "time")):
+            prep_col = v
+        if ts_col is None and any(x in k for x in ("timestamp", "time", "date", "created", "created_at", "delivered", "order_time")):
+            ts_col = v
 
     if units_col is None or prep_col is None:
-        st.error("Could not detect 'units' or 'prep time' columns automatically.")
-        st.write("Columns found:", list(df.columns)[:50])
-        st.stop()
+        raise SystemExit("Couldn't detect units or prep time columns. Found: " + ", ".join(df.columns.astype(str)))
 
-    # Convert units
-    try:
-        df["units"] = pd.to_numeric(df[units_col], errors="coerce").fillna(0).astype(int)
-    except Exception:
-        # fallback: coerce to int in a safer way
-        df["units"] = df[units_col].apply(lambda x: int(float(x)) if pd.notna(x) else 0)
+    # Keep only relevant columns + optional day/hour columns you provided
+    extra_cols = []
+    if DAY_COL_CANDIDATE in df.columns:
+        extra_cols.append(DAY_COL_CANDIDATE)
+    if HOUR_COL_CANDIDATE in df.columns:
+        extra_cols.append(HOUR_COL_CANDIDATE)
+    if ts_col and ts_col in df.columns and ts_col not in extra_cols:
+        extra_cols.append(ts_col)
 
-    # Build prep_seconds using a stable list comprehension (avoids reindex issues)
-    prep_values = df[prep_col].tolist()
-    prep_seconds = [to_seconds_safe(x) for x in prep_values]
-    df["prep_seconds"] = prep_seconds  # length matches because .tolist()
+    df = df[[units_col, prep_col] + extra_cols].copy()
 
-    # Timestamp -> hour if present
-    if ts_col in df.columns:
-        try:
-            df["ts"] = pd.to_datetime(df[ts_col], errors="coerce")
-            df["hour"] = df["ts"].dt.hour.fillna(0).astype(int)
-        except Exception:
-            df["hour"] = 0
+    # numeric units
+    df["units"] = pd.to_numeric(df[units_col], errors="coerce").fillna(0).astype(int)
+
+    # prepare seconds safely (vectorized apply is ok here because we handle scalars robustly)
+    df["prep_seconds"] = df[prep_col].apply(lambda x: to_seconds_safe(pd, x))
+
+    # day_of_week: prefer the explicit column you provided
+    if DAY_COL_CANDIDATE in df.columns:
+        df["day_of_week"] = df[DAY_COL_CANDIDATE].apply(lambda x: normalize_day_col(pd, x) or "Unknown")
+    elif ts_col and ts_col in df.columns:
+        df["ts"] = pd.to_datetime(df[ts_col], errors="coerce")
+        if df["ts"].notna().any():
+            df["day_of_week"] = df["ts"].dt.day_name()
+        else:
+            df["day_of_week"] = "Unknown"
+    else:
+        df["day_of_week"] = "Unknown"
+
+    # hour: prefer the explicit hour column you provided
+    if HOUR_COL_CANDIDATE in df.columns:
+        df["hour"] = pd.to_numeric(df[HOUR_COL_CANDIDATE], errors="coerce").fillna(0).astype(int)
+    elif "ts" in df.columns:
+        df["hour"] = df["ts"].dt.hour.fillna(0).astype(int)
     else:
         df["hour"] = 0
 
-    df["hour_bucket"] = df["hour"].apply(hour_bucket)
+    df["hour_bucket"] = df["hour"].apply(hour_bucket_from_hour)
 
-    # Units bucket labels and cut
+    # units buckets
     labels = []
-    for i in range(len(UNIT_BINS)-1):
-        labels.append(f"{UNIT_BINS[i]+1}-{UNIT_BINS[i+1] if UNIT_BINS[i+1] < 10**8 else '999'}")
-    try:
-        df["units_bucket"] = pd.cut(df["units"], bins=UNIT_BINS, labels=labels)
-    except Exception:
-        # fallback: simple mapping by integer
-        df["units_bucket"] = df["units"].apply(lambda u: next((lab for i, lab in enumerate(labels) if UNIT_BINS[i] < u <= UNIT_BINS[i+1]), "unknown"))
+    for i in range(len(UNIT_BINS) - 1):
+        hi = UNIT_BINS[i+1]
+        labels.append(f"{UNIT_BINS[i]+1}-{hi if hi<99999 else '999'}")
+    df["units_bucket"] = pd.cut(df["units"], bins=UNIT_BINS, labels=labels, right=True)
 
-    # Aggregate: group by hour_bucket + units_bucket (and optionally day if desired)
+    # aggregate per day_of_week, hour_bucket, units_bucket
     rows = []
-    group_cols = ["hour_bucket", "units_bucket"]
-
+    group_cols = ["day_of_week", "hour_bucket", "units_bucket"]
     grouped = df.groupby(group_cols, dropna=False)
-    for name, g in grouped:
-        vals = pd.to_numeric(g["prep_seconds"], errors="coerce").dropna().values
+
+    for (day, hour_b, units_b), g in grouped:
+        vals = g["prep_seconds"].dropna().astype(float).tolist()
         if len(vals) == 0:
             continue
+        # compute p75
         p75 = float(np.percentile(vals, 75))
-        minutes = round_half_up_minutes(p75)
+        p75_rounded = round_half_up_seconds(p75)
         rows.append({
-            "hour_bucket": name[0],
-            "units_bucket": str(name[1]),
-            "p75_seconds": int(minutes * 60),
+            "day_of_week": day,
+            "hour_bucket": hour_b,
+            "units_bucket": str(units_b),
+            "p75_seconds": int(p75_rounded),
             "orders_count": int(len(vals)),
-            "base_p75_minutes": int(minutes)
+            "base_p75_minutes": int(p75_rounded // 60)
         })
 
     out = pd.DataFrame(rows)
-    if out.empty:
-        st.warning("No valid prep_seconds values found after parsing. Check your prep column format.")
-        st.write("Preview (first rows):")
-        st.dataframe(df.head(10))
-        st.stop()
+    if not out.empty:
+        # apply merging / monotonic post-processing per day/hour (optional: keep as-is if you prefer)
+        # כאן נשמור את המיזוג/מונוטוני כמחלקה נפרדת אם תרצה בהמשך; כרגע שמרנו את p75 ישירות.
+        out = out.sort_values(["day_of_week", "hour_bucket", "units_bucket"])
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    out.to_csv(args.out, index=False)
+    print("Wrote", args.out)
+    print("Rows:", len(out))
 
-    out = out.sort_values(["hour_bucket", "units_bucket"]).reset_index(drop=True)
-
-    st.success("Done — results below")
-    st.dataframe(out)
-
-    csv = out.to_csv(index=False).encode("utf-8")
-    st.download_button("Download CSV", csv, file_name="prep_p75.csv", mime="text/csv")
+if __name__ == "__main__":
+    main()
