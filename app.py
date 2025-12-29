@@ -5,199 +5,168 @@ import numpy as np
 import math
 from io import BytesIO
 
-st.set_page_config(page_title="Auto-Accept Prep Rules", layout="wide")
-st.title("Auto-Accept Prep Rules")
-st.write("העלה קובץ Excel ותקבל CSV עם זמני הכנה (P75)")
+st.set_page_config(page_title="Prep Time P75", layout="wide")
+st.title("Prep Time P75 Generator")
 
-# ----------------- Config -----------------
-UNIT_BINS = [0, 5, 10, 15, 20, 25, 55, 99999]
+# ---------------- CONFIG ----------------
+UNIT_BINS = [0, 5, 10, 15, 20, 25, 55, 10**9]
 HOUR_BUCKETS = [
     ("06-12", 6, 11),
     ("12-17", 12, 16),
     ("17-23", 17, 22),
 ]
 
-# ----------------- Helpers -----------------
-def detect_columns(df):
-    cols = {str(c).lower(): c for c in df.columns}
+# ---------------- HELPERS ----------------
+def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make column names unique (fix duplicate headers from Excel)
+    """
+    df = df.copy()
+    df.columns = pd.io.parsers.ParserBase(
+        {"names": df.columns}
+    )._maybe_dedup_names(df.columns)
+    return df
+
+
+def detect_columns(df: pd.DataFrame):
     units_col = None
     prep_col = None
-    ts_col = None
+    hour_col = None
 
-    for k, v in cols.items():
-        if units_col is None and any(x in k for x in ("units", "items", "qty")):
-            units_col = v
-        if prep_col is None and any(x in k for x in ("prep", "prepare", "time")):
-            prep_col = v
-        if ts_col is None and any(x in k for x in ("date", "time", "timestamp", "created")):
-            ts_col = v
+    for c in df.columns:
+        cl = c.lower()
+        if units_col is None and any(x in cl for x in ["units", "items", "qty"]):
+            units_col = c
+        if prep_col is None and any(x in cl for x in ["prep", "prepare", "time"]):
+            prep_col = c
+        if hour_col is None and "hour" in cl:
+            hour_col = c
 
-    return units_col, prep_col, ts_col
+    return units_col, prep_col, hour_col
 
-def _is_non_scalar(obj):
-    # treat strings/bytes as scalar
-    if isinstance(obj, (str, bytes)):
-        return False
-    # pandas objects and numpy arrays etc.
-    return hasattr(obj, "__len__") and not isinstance(obj, (str, bytes))
 
-def to_seconds(x):
+def to_seconds_safe(x):
     """
-    Robust conversion of many formats to integer seconds.
-    If x is non-scalar (Series/ndarray), try to extract scalar via .item().
-    If cannot extract, return None.
+    Convert value to seconds safely.
+    Never raises.
     """
-    # handle non-scalar containers gracefully
-    try:
-        if _is_non_scalar(x):
-            # try to extract scalar (e.g., numpy scalar inside an array or single-element Series)
-            if hasattr(x, "item"):
-                try:
-                    x = x.item()
-                except Exception:
-                    # item() failed — give up
-                    return None
-            else:
-                # list/tuple/Index etc. — if length 1, use first element
-                try:
-                    if len(x) == 1:
-                        x = x[0]
-                    else:
-                        return None
-                except Exception:
-                    return None
-    except Exception:
-        return None
-
-    # now x should be scalar (or string)
     if pd.isna(x):
-        return None
+        return np.nan
 
+    # pandas Timedelta
+    if hasattr(x, "total_seconds"):
+        return x.total_seconds()
+
+    # numeric
     if isinstance(x, (int, float, np.integer, np.floating)):
-        try:
-            return int(x)
-        except Exception:
-            return None
+        return float(x)
 
     s = str(x).strip()
-    if s == "":
-        return None
-
-    # hh:mm:ss or mm:ss
     if ":" in s:
+        parts = s.split(":")
         try:
-            parts = [int(p) for p in s.split(":")]
+            parts = [int(p) for p in parts]
             if len(parts) == 3:
-                return parts[0] * 3600 + parts[1] * 60 + parts[2]
+                return parts[0]*3600 + parts[1]*60 + parts[2]
             if len(parts) == 2:
-                return parts[0] * 60 + parts[1]
-            return parts[0]
-        except Exception:
-            # fall through to numeric parse
-            pass
+                return parts[0]*60 + parts[1]
+        except:
+            return np.nan
 
-    # numeric string
     try:
-        return int(float(s))
-    except Exception:
-        return None
+        return float(s)
+    except:
+        return np.nan
+
 
 def hour_bucket(h):
     try:
         h = int(h)
-    except Exception:
+    except:
         return "other"
+
     for name, start, end in HOUR_BUCKETS:
         if start <= h <= end:
             return name
     return "other"
 
-def round_half_up(x):
-    return int(math.floor(x + 0.5))
 
-# ----------------- UI -----------------
+def round_half_up_minutes(seconds):
+    return int(math.floor(seconds / 60 + 0.5))
+
+
+# ---------------- UI ----------------
 uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
-venue = st.text_input("Venue (אופציונלי)")
 generate = st.button("Generate CSV")
 
 if generate:
     if uploaded is None:
-        st.error("לא הועלה קובץ")
+        st.error("Please upload an Excel file")
+        st.stop()
+
+    # Read file
+    df = pd.read_excel(BytesIO(uploaded.read()), engine="openpyxl")
+
+    # Fix duplicate headers
+    df = clean_columns(df)
+
+    # Detect columns
+    units_col, prep_col, hour_col = detect_columns(df)
+
+    if units_col is None or prep_col is None:
+        st.error("Could not detect units or prep time columns")
+        st.write("Columns found:", list(df.columns))
+        st.stop()
+
+    # Units
+    df["units"] = pd.to_numeric(df[units_col], errors="coerce").fillna(0).astype(int)
+
+    # Prep seconds (NO apply, NO reindex)
+    prep_series = df[prep_col].values
+    df["prep_seconds"] = np.array([to_seconds_safe(x) for x in prep_series])
+
+    # Hour
+    if hour_col is not None:
+        df["hour"] = pd.to_numeric(df[hour_col], errors="coerce").fillna(0).astype(int)
     else:
-        try:
-            df = pd.read_excel(BytesIO(uploaded.read()), engine="openpyxl")
-        except Exception as e:
-            st.error("לא הצלחנו לקרוא את הקובץ (בדוק שהוא XLSX תקין)")
-            st.exception(e)
-            st.stop()
+        df["hour"] = 0
 
-        units_col, prep_col, ts_col = detect_columns(df)
-        if units_col is None or prep_col is None:
-            st.error("לא נמצאו עמודות 'units' או 'prep time' בקובץ (בדוק שמות העמודות).")
-            st.write("עמודות שבקובץ:", list(df.columns))
-            st.stop()
+    df["hour_bucket"] = df["hour"].apply(hour_bucket)
 
-        # keep relevant cols
-        cols_keep = [units_col, prep_col]
-        if ts_col:
-            cols_keep.append(ts_col)
-        df = df[cols_keep].copy()
+    # Units bucket
+    labels = [
+        f"{UNIT_BINS[i]+1}-{UNIT_BINS[i+1] if UNIT_BINS[i+1] < 10**8 else '999'}"
+        for i in range(len(UNIT_BINS)-1)
+    ]
+    df["units_bucket"] = pd.cut(df["units"], bins=UNIT_BINS, labels=labels)
 
-        # normalize units
-        df["units"] = pd.to_numeric(df[units_col], errors="coerce").fillna(0).astype(int)
+    # Aggregate
+    rows = []
+    for (hour_b, units_b), g in df.groupby(["hour_bucket", "units_bucket"]):
+        vals = g["prep_seconds"].dropna()
+        if len(vals) == 0:
+            continue
 
-        # compute prep_seconds robustly
-        # We'll apply to each element; function handles Series/arrays too.
-        try:
-            df["prep_seconds"] = df[prep_col].apply(to_seconds)
-        except Exception as e:
-            st.error("שגיאה בחישוב prep_seconds — פרטי השגיאה למטה")
-            st.exception(e)
-            st.stop()
+        p75 = np.percentile(vals, 75)
+        minutes = round_half_up_minutes(p75)
 
-        # optional timestamp handling
-        if ts_col:
-            df["ts"] = pd.to_datetime(df[ts_col], errors="coerce")
-            df["day_of_week"] = df["ts"].dt.day_name().fillna("Unknown")
-            df["hour"] = df["ts"].dt.hour.fillna(0).astype(int)
-        else:
-            df["day_of_week"] = "Unknown"
-            df["hour"] = 0
+        rows.append({
+            "hour_bucket": hour_b,
+            "units_bucket": str(units_b),
+            "p75_seconds": int(minutes * 60),
+            "orders_count": len(vals),
+            "base_p75_minutes": minutes,
+        })
 
-        df["hour_bucket"] = df["hour"].apply(hour_bucket)
+    out = pd.DataFrame(rows).sort_values(["hour_bucket", "units_bucket"])
 
-        labels = [
-            f"{UNIT_BINS[i]+1}-{UNIT_BINS[i+1] if UNIT_BINS[i+1] < 99999 else '999'}"
-            for i in range(len(UNIT_BINS)-1)
-        ]
-        df["units_bucket"] = pd.cut(df["units"], bins=UNIT_BINS, labels=labels)
+    st.success("Done")
+    st.dataframe(out)
 
-        # aggregate groups
-        rows = []
-        group_cols = ["day_of_week", "hour_bucket", "units_bucket"]
-
-        for (day, hour_b, units_b), g in df.groupby(group_cols):
-            vals = g["prep_seconds"].dropna().astype(float)
-            if len(vals) == 0:
-                continue
-            p75 = float(np.percentile(vals, 75))
-            p75_rounded = round_half_up(p75 / 60.0) * 60
-            rows.append({
-                "day_of_week": day,
-                "hour_bucket": hour_b,
-                "units_bucket": str(units_b),
-                "p75_seconds": int(p75_rounded),
-                "orders_count": int(len(vals)),
-                "base_p75_minutes": int(p75_rounded // 60),
-            })
-
-        out = pd.DataFrame(rows)
-        if out.empty:
-            st.warning("לא נמצאו ערכים תקפים אחרי המרה (בדוק את עמודת ה-prep/time).")
-        else:
-            out = out.sort_values(["day_of_week", "hour_bucket", "units_bucket"])
-            st.success("החישוב הושלם")
-            st.dataframe(out)
-
-            csv = out.to_csv(index=False).encode("utf-8")
-            st.download_button("Download CSV", csv, file_name="prep_p75.csv", mime="text/csv")
+    csv = out.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download CSV",
+        csv,
+        file_name="prep_p75.csv",
+        mime="text/csv"
+    )
