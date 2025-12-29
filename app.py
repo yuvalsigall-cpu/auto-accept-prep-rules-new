@@ -1,121 +1,124 @@
-#!/usr/bin/env python3
-"""
-app.py - compute p75 prep times from order-level Excel
-
-Usage:
- - CLI: python app.py --input path/in.xlsx --out path/out.csv
- - Streamlit UI: streamlit run app.py   (upload file, Run)
-"""
-from __future__ import annotations
-import argparse
+# app.py
+import streamlit as st
+import pandas as pd
+import numpy as np
 import math
-import time
-import importlib
-import sys
-import os
-from typing import Optional
+from io import BytesIO
 
-# optional streamlit UI
-try:
-    import streamlit as st  # type: ignore
-except Exception:
-    st = None
+st.set_page_config(layout="wide", page_title="Prep p75 exporter")
 
-# -------- lazy imports (robust) --------
-def _try_import(name: str):
-    try:
-        return importlib.import_module(name)
-    except ModuleNotFoundError:
-        return None
-
-def get_pandas(retries: int = 8, delay: float = 0.8):
-    backoff = delay
-    for _ in range(retries):
-        mod = _try_import("pandas")
-        if mod is not None:
-            return mod
-        time.sleep(backoff)
-        backoff = min(backoff * 1.2, 3.0)
-    return importlib.import_module("pandas")
-
-def get_numpy(retries: int = 8, delay: float = 0.8):
-    backoff = delay
-    for _ in range(retries):
-        mod = _try_import("numpy")
-        if mod is not None:
-            return mod
-        time.sleep(backoff)
-        backoff = min(backoff * 1.2, 3.0)
-    return importlib.import_module("numpy")
-
-# -------- constants --------
 UNIT_BINS = [0, 5, 10, 15, 20, 25, 55, 99999]
 HOUR_BUCKETS = [
     ("06-12", 6, 11),
     ("12-17", 12, 16),
     ("17-23", 17, 22),
 ]
-DEFAULT_LOOKBACK_MONTHS = 6
 
-# -------- helpers --------
-def make_columns_unique(cols):
-    """Make duplicate column names unique by adding suffix __dupN"""
+def make_unique_columns(cols):
+    """Make duplicate column names unique by adding suffixes."""
     seen = {}
-    out = []
+    new = []
     for c in cols:
-        key = str(c)
-        if key in seen:
-            seen[key] += 1
-            out.append(f"{key}__dup{seen[key]}")
+        if c not in seen:
+            seen[c] = 0
+            new.append(c)
         else:
-            seen[key] = 0
-            out.append(key)
-    return out
+            seen[c] += 1
+            new_name = f"{c}__dup{seen[c]}"
+            # ensure not colliding with existing
+            while new_name in seen:
+                seen[c] += 1
+                new_name = f"{c}__dup{seen[c]}"
+            seen[new_name] = 0
+            new.append(new_name)
+    return new
 
 def detect_columns(df):
-    """Return (units_col, prep_col, ts_col_or_None). Works on exact df.columns."""
-    cols_map = {str(c).lower(): c for c in df.columns}
-    units_col = None
-    prep_col = None
-    ts_col = None
-    for lower, orig in cols_map.items():
-        if units_col is None and any(k in lower for k in ("units","items","qty","quantity")):
-            units_col = orig
-        if prep_col is None and any(k in lower for k in ("prep","prepare","preparation","prep_time","preptime","time to prepare","time_to_prepare","preparation_time")):
-            prep_col = orig
-        if ts_col is None and any(k in lower for k in ("timestamp","time","date","created","delivered","received","time_received","time_delivered")):
-            ts_col = orig
-    return units_col, prep_col, ts_col
+    """Return (units_col, prep_col, ts_col, optional_hour_col, optional_day_col) - names or None"""
+    cols_lower = {c.lower(): c for c in df.columns}
+    # exact helpful names
+    exact_day = ["time delivered day of week", "time delivered day", "day of week", "day"]
+    exact_hour = ["time received hour of the day", "time received hour", "hour of day", "hour"]
+    # search for units
+    units = None
+    prep = None
+    ts = None
+    hourcol = None
+    daycol = None
 
-def to_seconds(x, pd):
-    """Convert single value to seconds. Returns None if cannot parse."""
-    import numpy as _np
-    # avoid accepting Series/array here
-    if isinstance(x, (pd.Series, _np.ndarray)):
-        return None
-    if pd.isna(x):
-        return None
-    if isinstance(x, (int, float)):
+    # try exacts
+    for e in exact_day:
+        if e in cols_lower and daycol is None:
+            daycol = cols_lower[e]
+    for e in exact_hour:
+        if e in cols_lower and hourcol is None:
+            hourcol = cols_lower[e]
+
+    # generic heuristics
+    for low, orig in cols_lower.items():
+        if units is None and any(k in low for k in ("units", "items", "qty", "quantity")):
+            units = orig
+        if prep is None and any(k in low for k in ("prep", "prepare", "preparation", "time to prepare", "prep_seconds", "prep time")):
+            prep = orig
+        if ts is None and any(k in low for k in ("timestamp", "time", "date", "delivered", "received")):
+            # prefer full timestamp-like columns; we'll refine later
+            ts = orig
+
+    # if there is a column explicitly named like "time delivered..." prefer it as ts or day
+    # already handled some above
+
+    return units, prep, ts, hourcol, daycol
+
+def to_seconds_scalar(x):
+    """Convert a single scalar to integer seconds or None. Robust parsing."""
+    try:
+        if pd.isna(x):
+            return None
+    except Exception:
+        # if pd.isna fails on weird input, fallback
+        pass
+    # numeric
+    if isinstance(x, (int, float, np.integer, np.floating)) and not (isinstance(x, float) and math.isnan(x)):
         try:
             return int(x)
         except Exception:
             return None
     s = str(x).strip()
-    if s == "":
+    if s == "" or s.lower() in ("nan", "none", "null"):
         return None
+    # patterns like H:M:S or M:S
     if ":" in s:
         parts = [p for p in s.split(":") if p != ""]
         try:
             parts = [int(p) for p in parts]
         except Exception:
-            return None
+            # maybe "0:02:30.0" etc -> try floats
+            try:
+                parts = [int(float(p)) for p in parts]
+            except Exception:
+                return None
         if len(parts) == 3:
-            return parts[0]*3600 + parts[1]*60 + parts[2]
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
         if len(parts) == 2:
-            return parts[0]*60 + parts[1]
+            return parts[0] * 60 + parts[1]
         return parts[0]
+    # maybe "2m30s", "2h", "150s"
+    s_low = s.lower()
+    # handle simple patterns: number with unit
+    import re
+    m = re.match(r"^(\d+\.?\d*)\s*(s|sec|secs|seconds)$", s_low)
+    if m:
+        return int(float(m.group(1)))
+    m = re.match(r"^(\d+\.?\d*)\s*(m|min|mins|minutes)$", s_low)
+    if m:
+        return int(float(m.group(1)) * 60)
+    m = re.match(r"^(\d+\.?\d*)\s*(h|hr|hrs|hours)$", s_low)
+    if m:
+        return int(float(m.group(1)) * 3600)
+    # fallback numeric parse
     try:
-        return int(float(s))
+        val = float(s)
+        return int(val)
     except Exception:
         return None
 
@@ -132,182 +135,149 @@ def hour_bucket_from_hour(h):
 def round_half_up(x):
     return int(math.floor(x + 0.5))
 
-# -------- core computation --------
-def compute_p75_from_dataframe(df, lookback_months: int = DEFAULT_LOOKBACK_MONTHS, venue: Optional[str] = None):
-    pd = get_pandas()
-    np = get_numpy()
+def compute_p75(df, units_col, prep_col, ts_col=None, hour_col=None, day_col=None, lookback_months=6):
+    # make sure columns unique
+    df = df.copy()
+    df.columns = make_unique_columns(df.columns)
 
-    # make copy and ensure unique column names if duplicates exist (this fixes the reindex error)
-    dfc = df.copy()
-    if dfc.columns.duplicated().any():
-        dfc.columns = make_columns_unique(list(dfc.columns))
-
-    # detect columns
-    units_col, prep_col, ts_col = detect_columns(dfc)
-    # helpful error message listing columns
-    if units_col is None or prep_col is None:
-        raise ValueError("Couldn't detect required columns. Available columns: " + ", ".join(map(str, dfc.columns)))
-
-    # optional venue filter
-    if venue:
-        venue_cols = [c for c in dfc.columns if 'venue' in str(c).lower() or 'store' in str(c).lower()]
-        if venue_cols:
-            vcol = venue_cols[0]
-            dfc = dfc[dfc[vcol].astype(str).str.contains(venue, case=False, na=False)]
-
-    # keep relevant columns
-    keep = [units_col, prep_col] + ([ts_col] if ts_col else [])
-    dfw = dfc[keep].copy()
-
-    # normalize units
-    dfw["units"] = pd.to_numeric(dfw[units_col], errors="coerce").fillna(0).astype(int)
-
-    # ensure prep series is a Series (not DataFrame) even if name collision existed
-    s_prep = dfw[prep_col]
-    if isinstance(s_prep, pd.DataFrame):
-        # choose first column if duplicated labels produced a DataFrame
-        s_prep = s_prep.iloc[:, 0]
-
-    # compute prep_seconds safely using list comprehension to avoid pandas weirdness
-    prep_list = []
-    for v in s_prep.tolist():
-        prep_list.append(to_seconds(v, pd))
-    dfw["prep_seconds"] = pd.Series(prep_list, index=dfw.index)
-
-    # timestamp handling and lookback
-    if ts_col and ts_col in dfw.columns:
-        # make sure ts column also single series
-        s_ts = dfw[ts_col]
-        if isinstance(s_ts, pd.DataFrame):
-            s_ts = s_ts.iloc[:,0]
-        dfw["ts"] = pd.to_datetime(s_ts, errors="coerce")
-        if lookback_months and lookback_months > 0:
-            cutoff = pd.Timestamp.now() - pd.DateOffset(months=int(lookback_months))
-            dfw = dfw[dfw["ts"].isna() | (dfw["ts"] >= cutoff)]
-
-    # day/hour
-    if "ts" in dfw.columns and dfw["ts"].notna().any():
-        dfw["day_of_week"] = dfw["ts"].dt.day_name()
-        dfw["hour"] = dfw["ts"].dt.hour.fillna(0).astype(int)
+    # if units column missing, set default units=1
+    if units_col is None or units_col not in df.columns:
+        df["units"] = 1
     else:
-        dfw["day_of_week"] = "Unknown"
-        dfw["hour"] = 0
+        df["units"] = pd.to_numeric(df[units_col], errors="coerce").fillna(0).astype(int)
 
-    dfw["hour_bucket"] = dfw["hour"].apply(hour_bucket_from_hour)
+    # prep_seconds: vectorize parsing
+    if prep_col is None or prep_col not in df.columns:
+        raise ValueError("Couldn't find a preparation-time column (prep).")
+    # apply scalar function safely
+    df["prep_seconds"] = df[prep_col].apply(lambda x: to_seconds_scalar(x))
 
-    # units buckets
-    bins = UNIT_BINS
+    # timestamps / day / hour
+    if day_col and day_col in df.columns:
+        df["day_of_week"] = df[day_col].astype(str)
+    elif hour_col and hour_col in df.columns:
+        # if we have only hour column, set day unknown but take hour
+        df["day_of_week"] = "Unknown"
+        df["hour"] = pd.to_numeric(df[hour_col], errors="coerce").fillna(0).astype(int)
+    elif ts_col and ts_col in df.columns:
+        df["ts"] = pd.to_datetime(df[ts_col], errors="coerce")
+        # lookback filter
+        if lookback_months is not None and lookback_months > 0:
+            cutoff = pd.Timestamp.now() - pd.DateOffset(months=lookback_months)
+            df = df[df["ts"].isna() | (df["ts"] >= cutoff)]
+        # extract day and hour
+        if df["ts"].notna().any():
+            df["day_of_week"] = df["ts"].dt.day_name()
+            df["hour"] = df["ts"].dt.hour
+        else:
+            df["day_of_week"] = "Unknown"
+            df["hour"] = 0
+    else:
+        # no timestamp info at all
+        df["day_of_week"] = "Unknown"
+        df["hour"] = 0
+
+    # if hour column exists but not set above
+    if "hour" not in df.columns and hour_col and hour_col in df.columns:
+        df["hour"] = pd.to_numeric(df[hour_col], errors="coerce").fillna(0).astype(int)
+
+    df["hour_bucket"] = df["hour"].apply(hour_bucket_from_hour)
+
+    # units buckets (labels)
     labels = []
-    for i in range(len(bins)-1):
-        labels.append(f"{bins[i]+1}-{bins[i+1] if bins[i+1]<99999 else '999'}")
-    dfw["units_bucket"] = pd.cut(dfw["units"], bins=bins, labels=labels, right=True)
+    for i in range(len(UNIT_BINS) - 1):
+        labels.append(f"{UNIT_BINS[i]+1}-{UNIT_BINS[i+1] if UNIT_BINS[i+1] < 99999 else '999'}")
+    df["units_bucket"] = pd.cut(df["units"], bins=UNIT_BINS, labels=labels, right=True)
+
+    # filter rows with valid prep_seconds
+    df_valid = df[df["prep_seconds"].notna()].copy()
+    if df_valid.empty:
+        return pd.DataFrame([])  # empty result
 
     # group and compute p75
     rows = []
     group_cols = ["day_of_week", "hour_bucket", "units_bucket"]
-    grouped = dfw.groupby(group_cols, dropna=False)
-
+    grouped = df_valid.groupby(group_cols, dropna=False)
     for name, g in grouped:
         day, hour_b, units_b = name
-        values = g["prep_seconds"].dropna().astype(float)
-        count = int(values.shape[0])
-        if count == 0:
+        values = g["prep_seconds"].astype(float).values
+        if len(values) == 0:
             continue
-        p75 = float(get_numpy().percentile(values, 75))
-        p75_rounded_seconds = round_half_up(p75 / 60.0) * 60
+        p75 = float(np.percentile(values, 75))
+        p75_rounded = round_half_up(p75 / 60.0) * 60
         rows.append({
             "day_of_week": day,
             "hour_bucket": hour_b,
             "units_bucket": str(units_b),
-            "p75_seconds": int(p75_rounded_seconds),
-            "orders_count": count,
-            "base_p75_minutes": int(p75_rounded_seconds // 60)
+            "p75_seconds": int(p75_rounded),
+            "orders_count": int(len(values)),
+            "base_p75_minutes": int(p75_rounded // 60)
         })
-
-    out = get_pandas().DataFrame(rows)
+    out = pd.DataFrame(rows)
     if out.empty:
-        out = get_pandas().DataFrame(columns=["day_of_week","hour_bucket","units_bucket","p75_seconds","orders_count","base_p75_minutes"])
-    out = out.sort_values(["day_of_week","hour_bucket","units_bucket"])
+        return out
+    out = out.sort_values(["day_of_week", "hour_bucket", "units_bucket"])
     return out
 
-# -------- CLI & UI --------
-def cli_main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", "-i", required=True, help="input Excel (.xlsx)")
-    parser.add_argument("--out", "-o", required=True, help="output CSV")
-    parser.add_argument("--lookback_months", "-l", type=int, default=DEFAULT_LOOKBACK_MONTHS)
-    parser.add_argument("--venue", "-v", default=None)
-    args = parser.parse_args()
+# ---------- Streamlit UI ----------
+st.title("Auto-Accept Prep Rules — p75 exporter")
+st.markdown("העלה קובץ Excel, בדוק זיהוי עמודות ולחץ **Generate CSV**")
 
-    pd = get_pandas()
-    print("Reading", args.input)
-    df = pd.read_excel(args.input, engine="openpyxl")
-    print("Detected columns:", ", ".join(map(str, df.columns)))
-    out = compute_p75_from_dataframe(df, lookback_months=args.lookback_months, venue=args.venue)
-    out.to_csv(args.out, index=False)
-    print("Wrote", args.out)
+uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx","xls"])
+if uploaded is None:
+    st.info("העלה כאן את הקובץ ואנחנו נמשיך.")
+    st.stop()
 
-def streamlit_main():
-    pd = get_pandas()
-    st.set_page_config(page_title="Prep p75 tool", layout="wide")
-    st.title("Prep p75 generator")
-    st.markdown("Upload order-level Excel. The tool detects columns heuristically (units, prep-time, timestamp).")
+# read excel (first sheet)
+try:
+    df = pd.read_excel(uploaded, engine="openpyxl")
+except Exception as e:
+    st.error(f"Error reading Excel: {e}")
+    st.stop()
 
-    uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx","xls"])
-    default_input_path = None
+# fix duplicate column names
+if df.columns.duplicated().any():
+    st.warning("נמצאו שמות עמודות כפולים — נעשה אותם ייחודיים אוטומטית.")
+    df.columns = make_unique_columns(df.columns)
+
+st.success(f"Loaded uploaded file: {uploaded.name}")
+
+# detect candidates
+units_col, prep_col, ts_col, hour_col, day_col = detect_columns(df)
+
+with st.expander("Detected / choose columns (אם לא נכון בחר ידנית)"):
+    st.write("Columns in file:", list(df.columns))
+    units_col = st.selectbox("Units column (כמות פריטים)", options=[None] + list(df.columns), index=0 if units_col is None else list(df.columns).index(units_col)+1)
+    prep_col = st.selectbox("Prep/time column (שעת הכנה)", options=[None] + list(df.columns), index=0 if prep_col is None else list(df.columns).index(prep_col)+1)
+    ts_col = st.selectbox("Timestamp column (תאריך/זמן) — optional", options=[None] + list(df.columns), index=0 if ts_col is None else list(df.columns).index(ts_col)+1)
+    hour_col = st.selectbox("Hour-only column (שעה) — optional", options=[None] + list(df.columns), index=0 if hour_col is None else (list(df.columns).index(hour_col)+1 if hour_col in df.columns else 0))
+    day_col = st.selectbox("Day-of-week column (יום בשבוע) — optional", options=[None] + list(df.columns), index=0 if day_col is None else (list(df.columns).index(day_col)+1 if day_col in df.columns else 0))
+
+lookback = st.number_input("Lookback months (0 = no filtering)", min_value=0, max_value=120, value=6, step=1)
+generate = st.button("Generate CSV")
+
+# small preview / quick stats
+st.write("Rows total:", len(df))
+if prep_col and prep_col in df.columns:
+    st.write("Non-empty prep values:", int(df[prep_col].notna().sum()))
+else:
+    st.write("Prep column not set.")
+
+if generate:
     try:
-        files = os.listdir("/mnt/data")
-        if files:
-            st.sidebar.markdown("Files in /mnt/data:")
-            for f in files:
-                st.sidebar.write(f)
-            default_input_path = os.path.join("/mnt/data", files[0])
-    except Exception:
-        pass
+        res = compute_p75(df, units_col, prep_col, ts_col=ts_col, hour_col=hour_col, day_col=day_col, lookback_months=(lookback if lookback>0 else None))
+        if res.empty:
+            st.error("אין תוצאות — לא נמצאו שורות עם ערכי זמן תקינים לעיבוד (prep seconds). בדוק את עמודת ה־prep וה־lookback.")
+            # show sample of prep column
+            if prep_col and prep_col in df.columns:
+                st.write("דוגמה לערכי prep (עד 30 לא-ריקים):")
+                st.write(df[prep_col].dropna().astype(str).head(30).tolist())
+            st.stop()
+        st.success(f"נוצרו {len(res)} שורות פלט.")
+        st.dataframe(res.head(200))
 
-    lookback = st.number_input("Lookback months (0 = no limit)", min_value=0, max_value=60, value=DEFAULT_LOOKBACK_MONTHS)
-    venue = st.text_input("Optional venue substring")
-
-    run_button = st.button("Run" if uploaded else "Run on default /mnt/data file")
-    df = None
-    if uploaded:
-        try:
-            df = pd.read_excel(uploaded, engine="openpyxl")
-            st.success(f"Loaded uploaded file: {uploaded.name}")
-            st.write("Columns detected:", list(df.columns))
-        except Exception as e:
-            st.error(f"Error reading uploaded file: {e}")
-    elif default_input_path and run_button:
-        try:
-            df = pd.read_excel(default_input_path, engine="openpyxl")
-            st.success(f"Loaded default file: {default_input_path}")
-            st.write("Columns detected:", list(df.columns))
-        except Exception as e:
-            st.error(f"Error reading default file: {e}")
-
-    if df is not None:
-        with st.spinner("Computing p75 ..."):
-            try:
-                out = compute_p75_from_dataframe(df, lookback_months=int(lookback), venue=venue if venue.strip() else None)
-                st.write("Results:")
-                st.dataframe(out)
-                csv_bytes = out.to_csv(index=False).encode("utf-8")
-                st.download_button("Download CSV", csv_bytes, file_name="prep_p75_output.csv", mime="text/csv")
-            except Exception as e:
-                st.error("Error during computation: " + str(e))
-
-if __name__ == "__main__":
-    # If streamlit is running this module, streamlit will import it and execute; we prefer UI
-    if st is not None and ("streamlit" in sys.argv[0] or any("streamlit" in a for a in sys.argv)):
-        streamlit_main()
-    else:
-        # CLI mode
-        if len(sys.argv) == 1:
-            # no args -> if streamlit available, run UI, else show usage
-            if st is not None:
-                streamlit_main()
-            else:
-                print("Run with: python app.py --input in.xlsx --out out.csv")
-                sys.exit(1)
-        else:
-            cli_main()
+        # prepare CSV for download
+        csv_bytes = res.to_csv(index=False).encode("utf-8")
+        st.download_button("Download CSV", data=csv_bytes, file_name="prep_p75_output.csv", mime="text/csv")
+    except Exception as e:
+        st.exception(f"Error during computation: {e}")
