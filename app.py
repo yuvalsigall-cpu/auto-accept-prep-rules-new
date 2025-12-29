@@ -2,15 +2,13 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import io
 import math
 from typing import List, Tuple, Optional
 
 st.set_page_config(page_title="Auto-Accept Prep Rules — p75 exporter", layout="wide")
 
-# ---------------- utils ----------------
+# ---------------- helpers ----------------
 def make_unique_columns(cols: List[str]) -> List[str]:
-    """Make duplicate column names unique by appending .1, .2, ..."""
     out = []
     seen = {}
     for c in cols:
@@ -20,7 +18,6 @@ def make_unique_columns(cols: List[str]) -> List[str]:
         else:
             seen[c] += 1
             new = f"{c}.{seen[c]}"
-            # ensure new is unique too
             while new in seen:
                 seen[c] += 1
                 new = f"{c}.{seen[c]}"
@@ -29,17 +26,15 @@ def make_unique_columns(cols: List[str]) -> List[str]:
     return out
 
 def normalize_colname(s: str) -> str:
-    """lower and strip"""
     return str(s).strip().lower()
 
-def detect_columns_auto(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """Try to detect columns: venue, purchase id, prep time, day name, hour, units"""
+def detect_columns_auto(df: pd.DataFrame):
     cols = list(df.columns)
     lower = {normalize_colname(c): c for c in cols}
-    # candidates for each role (patterns)
     venue_keys = ["venue", "venue name", "branch", "store", "merchant", "שם סניף"]
     pid_keys = ["purchase id", "order id", "purchaseid", "orderid", "מזהה הזמנה"]
-    prep_keys = ["time to prepare", "time to prepare the goods", "time to prepare the order", "time to prepare goods", "time to prepare", "prep", "prep time", "time to prepare the goods (hh:mm:ss)", "3) time to prepare the goods", "זמן להכין", "זמן להכנת"]
+    prep_keys = ["time to prepare", "time to prepare the goods", "prep", "prep time",
+                 "time to prepare the goods (hh:mm:ss)", "3) time to prepare the goods", "זמן להכין"]
     day_keys = ["day of week", "time delivered day of week", "day", "יום בשבוע"]
     hour_keys = ["hour", "time received hour of the day", "hour of the day", "time received hour", "שעה"]
     units_keys = ["units", "units sold total", "units sold", "quantity", "qty", "כמות יחידות", "כמות יחידות בהזמנה"]
@@ -49,7 +44,6 @@ def detect_columns_auto(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str],
             lk = normalize_colname(k)
             if lk in lower:
                 return lower[lk]
-        # try substring matching
         for col in cols:
             lc = normalize_colname(col)
             for k in keys:
@@ -63,23 +57,18 @@ def detect_columns_auto(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str],
     day = find(day_keys)
     hour = find(hour_keys)
     units = find(units_keys)
-
     return venue, pid, prep, day, hour, units
 
 def to_seconds_generic(x) -> Optional[int]:
-    """Convert value to seconds. Accepts timedeltas, '0 days 00:41:21', '00:41:21', numeric seconds, or floats."""
     if pd.isna(x):
         return None
-    # pandas Timedelta
     if isinstance(x, pd.Timedelta):
         return int(x.total_seconds())
-    # numpy timedelta64
     if isinstance(x, np.timedelta64):
         try:
             return int(pd.to_timedelta(x).total_seconds())
-        except Exception:
+        except:
             pass
-    # numeric
     if isinstance(x, (int, np.integer)) and not isinstance(x, bool):
         return int(x)
     if isinstance(x, (float, np.floating)):
@@ -87,15 +76,13 @@ def to_seconds_generic(x) -> Optional[int]:
     s = str(x).strip()
     if s == "":
         return None
-    # some excel exports include "0 days 00:41:20.976000"
+    # "0 days 00:41:21.976000"
     if "days" in s and "0 days" in s:
         try:
-            # pandas can parse it
             td = pd.to_timedelta(s)
             return int(td.total_seconds())
-        except Exception:
+        except:
             pass
-    # colon separated hh:mm:ss or mm:ss
     if ":" in s:
         parts = [p for p in s.split(":") if p != ""]
         try:
@@ -105,12 +92,11 @@ def to_seconds_generic(x) -> Optional[int]:
             if len(parts) == 2:
                 return parts[0]*60 + parts[1]
             return parts[0]
-        except Exception:
+        except:
             pass
-    # fallback try float/int
     try:
         return int(float(s))
-    except Exception:
+    except:
         return None
 
 def hour_bucket_from_hour(h):
@@ -129,32 +115,94 @@ def hour_bucket_from_hour(h):
 def round_half_up(x):
     return int(math.floor(x + 0.5))
 
+# utilities for merging buckets
+def parse_bucket_label(label: str) -> Tuple[int,int]:
+    """
+    label example: "1-5" or "81-999"
+    returns (low, high)
+    """
+    try:
+        a,b = label.split("-")
+        return int(a), int(b)
+    except:
+        # fallback
+        return (0, 99999)
+
+def make_label(low:int, high:int) -> str:
+    return f"{low}-{high}"
+
+def merge_adjacent_list(rows: List[dict], minute_threshold: int = 4) -> List[dict]:
+    """
+    rows: list of dicts sorted by units_bucket ascending. Each dict must have keys:
+        units_bucket (label like '1-5'), p75_seconds (int), orders_count (int)
+    Merge adjacent entries while abs(diff_in_minutes) <= minute_threshold.
+    After merge: units_bucket label is combined range, p75_seconds = max of p75_seconds,
+    orders_count = sum.
+    """
+    changed = True
+    # copy so we don't mutate original
+    cur = [r.copy() for r in rows]
+    while True:
+        merged_any = False
+        i = 0
+        new_list = []
+        while i < len(cur):
+            if i < len(cur)-1:
+                left = cur[i]
+                right = cur[i+1]
+                left_min = left["p75_seconds"]//60
+                right_min = right["p75_seconds"]//60
+                if abs(right_min - left_min) <= minute_threshold:
+                    # merge left & right
+                    l_low, l_high = parse_bucket_label(str(left["units_bucket"]))
+                    r_low, r_high = parse_bucket_label(str(right["units_bucket"]))
+                    new_label = make_label(l_low, r_high)
+                    merged = {
+                        "units_bucket": new_label,
+                        "p75_seconds": int(max(left["p75_seconds"], right["p75_seconds"])),
+                        "orders_count": int(left.get("orders_count",0) + right.get("orders_count",0)),
+                    }
+                    # other fields pass-through if exist (day/hour) — prefer left's
+                    for k in left:
+                        if k not in merged:
+                            merged[k] = left[k]
+                    for k in right:
+                        if k not in merged:
+                            merged[k] = merged.get(k, right[k])
+                    new_list.append(merged)
+                    i += 2
+                    merged_any = True
+                    continue
+            # no merge at i
+            new_list.append(cur[i])
+            i += 1
+        cur = new_list
+        if not merged_any:
+            break
+    return cur
+
 # ---------------- UI ----------------
 st.title("Auto-Accept Prep Rules — p75 exporter")
 st.caption("העלה Excel, בדוק זיהוי עמודות ולחץ **Generate CSV**")
 
-uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx", "xls"], accept_multiple_files=False)
-
+uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx","xls"], accept_multiple_files=False)
 if uploaded is None:
-    st.info("העלה כאן את קובץ ה-Excel שלך (העמודות שציינת: Time Delivered Day of Week, Time Received Hour of the Day, Units Sold Total, 3) Time to prepare the goods (hh:mm:ss) ).")
+    st.info("העלה כאן את קובץ ה-Excel שלך (עמודות לדוגמה: Time Delivered Day of Week, Time Received Hour of the Day, Units Sold Total, 3) Time to prepare the goods (hh:mm:ss) ).")
     st.stop()
 
-# read file into DataFrame
 try:
     df = pd.read_excel(uploaded, engine="openpyxl")
 except Exception as e:
     st.error(f"Error reading Excel: {e}")
     st.stop()
 
-# make column names unique to avoid duplicate-label errors
 orig_cols = list(df.columns)
 unique_cols = make_unique_columns([str(c) for c in orig_cols])
 df.columns = unique_cols
 
-st.success(f"Loaded uploaded file: {getattr(uploaded, 'name', 'uploaded file')}")
+st.success(f"Loaded uploaded file: {getattr(uploaded,'name','uploaded file')}")
 st.write(f"Rows total: **{len(df)}**")
 
-# auto-detect columns and allow override
 venue_col_auto, pid_col_auto, prep_col_auto, day_col_auto, hour_col_auto, units_col_auto = detect_columns_auto(df)
 
 with st.expander("Detected / choose columns (אם לא נכון בחר ידנית)"):
@@ -179,65 +227,61 @@ lookback_months = st.number_input("Lookback months (0 = no filtering)", min_valu
 
 st.write(f"Selected columns: prep = **{prep_col}**, day = **{day_col}**, hour = **{hour_col}**, units = **{units_col}**")
 
-# units bins & labels requested by you
-UNIT_BINS = [0, 5, 10, 20, 30, 40, 50, 80, 99999]
-UNIT_LABELS = [
-    "1-5",
-    "6-10",
-    "11-20",
-    "21-30",
-    "31-40",
-    "41-50",
-    "51-80",
-    "81-999",
-]
+# create 5-unit bins up to a large number
+MAX_UNITS = 1000
+step = 5
+unit_edges = list(range(0, MAX_UNITS+step, step))  # 0,5,10,...,1000
+unit_labels = []
+for i in range(len(unit_edges)-1):
+    low = unit_edges[i] + 1
+    high = unit_edges[i+1]
+    # last label: make sure it's open-ended if high is MAX_UNITS
+    if high >= MAX_UNITS:
+        label = f"{low}-{999}"
+    else:
+        label = f"{low}-{high}"
+    unit_labels.append(label)
 
-# Generate button
 if st.button("Generate CSV"):
     try:
         working = df.copy()
-        # compute prep_seconds safely
-        prep_list = [to_seconds_generic(x) for x in working[prep_col].tolist()]  # use .tolist on Series is ok
-        working["prep_seconds"] = prep_list
-
+        # compute prep_seconds
+        working["prep_seconds"] = [ to_seconds_generic(x) for x in working[prep_col].tolist() ]
         non_empty = working["prep_seconds"].notna().sum()
         st.write(f"Non-empty prep values: **{non_empty}**")
 
-        # timestamp lookback — we only filter if day or hour column is not explicitly datetime,
-        # but since user provides day string and hour numeric, the lookback will be skipped
-        # unless there is a datetime-like column (we attempt to detect).
-        # We won't fail on missing dates; just proceed.
+        if non_empty == 0:
+            st.error("אין תוצאות — לא נמצאו ערכי prep תקינים בעמודה שנבחרה.")
+            st.stop()
 
-        # day_of_week: take from user-selected column (string like Tuesday etc.)
+        # day_of_week
         working["day_of_week"] = working[day_col].astype(str).fillna("Unknown")
 
-        # hour: use hour_col value (should be numeric hour)
-        # if hour_col contains datetime values, extract hour
+        # hour
         if np.issubdtype(working[hour_col].dtype, np.datetime64):
             working["hour"] = pd.to_datetime(working[hour_col]).dt.hour
         else:
-            # attempt numeric conversion
             working["hour"] = pd.to_numeric(working[hour_col], errors="coerce").fillna(0).astype(int)
-
         working["hour_bucket"] = working["hour"].apply(hour_bucket_from_hour)
 
         # units numeric
         working["units"] = pd.to_numeric(working[units_col], errors="coerce").fillna(0).astype(int)
 
-        # make categorical ordered units_bucket
-        working["units_bucket"] = pd.cut(working["units"], bins=UNIT_BINS, labels=UNIT_LABELS, right=True)
-        working["units_bucket"] = working["units_bucket"].astype(pd.CategoricalDtype(categories=UNIT_LABELS, ordered=True))
+        # units buckets categorical (5-step)
+        working["units_bucket"] = pd.cut(working["units"], bins=unit_edges + [99999], labels=unit_labels, right=True)
+        working["units_bucket"] = working["units_bucket"].astype(pd.CategoricalDtype(categories=unit_labels, ordered=True))
 
-        # remove rows without prep_seconds
+        # filter rows with prep_seconds
         df_valid = working[working["prep_seconds"].notna()].copy()
         if df_valid.empty:
-            st.error("אין תוצאות — לא נמצאו שורות עם ערכי זמן תקינים בעמודת ה-prep (prep seconds). בדוק את העמודה שנבחרה כ־prep.")
+            st.error("אין שורות עם prep תקין לאחר סינון.")
             st.stop()
 
-        # aggregate p75
+        # aggregate base p75 per group
         agg_rows = []
         group_cols = ["day_of_week", "hour_bucket", "units_bucket"]
-        for (day, hb, ub), g in df_valid.groupby(group_cols):
+        grouped = df_valid.groupby(group_cols)
+        for (day, hb, ub), g in grouped:
             vals = g["prep_seconds"].dropna().astype(float).values
             if len(vals) == 0:
                 continue
@@ -252,31 +296,69 @@ if st.button("Generate CSV"):
                 "base_p75_minutes": int(p75_rounded // 60)
             })
 
-        out_df = pd.DataFrame(agg_rows)
-        if out_df.empty:
-            st.warning("לא נוצרו שורות אחרי האגרגציה — כנראה שאין שורות תואמות לקבוצות שנבחרו.")
+        if len(agg_rows) == 0:
+            st.warning("לא נוצרו שורות אגggregציה.")
             st.stop()
 
-        # ensure columns exist for sorting
-        # make day_of_week categorical in a reasonable order (Mon..Sun) if values match english names
+        base_df = pd.DataFrame(agg_rows)
+        # ensure units_bucket dtype ordered
+        base_df["units_bucket"] = pd.Categorical(base_df["units_bucket"], categories=unit_labels, ordered=True)
+        # sort for presentation
+        base_df = base_df.sort_values(["day_of_week", "hour_bucket", "units_bucket"]).reset_index(drop=True)
+
+        # Now: for each (day_of_week, hour_bucket) perform merging of adjacent buckets when diff in minutes <= 4
+        merged_rows_all = []
+        groups = base_df.groupby(["day_of_week", "hour_bucket"])
+        for (day, hb), sub in groups:
+            # sort by units_bucket order
+            sub_sorted = sub.sort_values("units_bucket").reset_index(drop=True)
+            # prepare simple list of dicts for merging
+            simple = []
+            for _, r in sub_sorted.iterrows():
+                simple.append({
+                    "day_of_week": day,
+                    "hour_bucket": hb,
+                    "units_bucket": str(r["units_bucket"]),
+                    "p75_seconds": int(r["p75_seconds"]),
+                    "orders_count": int(r["orders_count"])
+                })
+            # merge adjacent while threshold <=4 minutes
+            merged_simple = merge_adjacent_list(simple, minute_threshold=4)
+            # after merging, push to merged_rows_all
+            for item in merged_simple:
+                merged_rows_all.append({
+                    "day_of_week": item["day_of_week"],
+                    "hour_bucket": item["hour_bucket"],
+                    "units_bucket": item["units_bucket"],
+                    "p75_seconds": int(item["p75_seconds"]),
+                    "orders_count": int(item.get("orders_count",0)),
+                    "base_p75_minutes": int(item["p75_seconds"]//60)
+                })
+
+        out_df = pd.DataFrame(merged_rows_all)
+        if out_df.empty:
+            st.warning("לא נוצרו תוצאות לאחר מיזוגים.")
+            st.stop()
+
+        # Sort days in natural order if english names present
         day_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday","Unknown"]
         if set(out_df["day_of_week"].unique()).issubset(set(day_order)):
             out_df["day_of_week"] = pd.Categorical(out_df["day_of_week"], categories=day_order, ordered=True)
 
-        # ensure units_bucket categorical preserves requested order
-        out_df["units_bucket"] = pd.Categorical(out_df["units_bucket"], categories=UNIT_LABELS, ordered=True)
-
-        # sort
-        sort_cols = ["day_of_week", "hour_bucket", "units_bucket"]
-        existing_sort_cols = [c for c in sort_cols if c in out_df.columns]
-        out_df = out_df.sort_values(existing_sort_cols).reset_index(drop=True)
+        # For units_bucket use custom ordering by numeric lower bound
+        def lower_bound(label):
+            try:
+                return int(label.split("-")[0])
+            except:
+                return 999999
+        out_df["units_lower"] = out_df["units_bucket"].apply(lambda x: lower_bound(str(x)))
+        out_df = out_df.sort_values(["day_of_week","hour_bucket","units_lower"]).drop(columns=["units_lower"]).reset_index(drop=True)
 
         st.success("הפקה בוצעה — להורדה למטה")
-        st.dataframe(out_df.head(200))
+        st.dataframe(out_df.head(300))
 
-        # CSV download
         csv_bytes = out_df.to_csv(index=False).encode("utf-8")
-        st.download_button("Download CSV", data=csv_bytes, file_name="prep_p75_output.csv", mime="text/csv")
+        st.download_button("Download CSV", data=csv_bytes, file_name="prep_p75_output_merged.csv", mime="text/csv")
 
     except Exception as e:
         st.exception(f"Error during computation: {e}")
